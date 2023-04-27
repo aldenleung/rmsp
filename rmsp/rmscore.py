@@ -1,14 +1,3 @@
-'''
-Running a command in a (another) conda environment
-
-Some software must be run within a specific environment (e.g. python 2). We do not support running python functions designed for different environments. 
-
- 
-Created on Jan 28, 2021
-
-@author: Alden
-'''
-
 import sys
 import os
 import subprocess
@@ -20,9 +9,9 @@ import dateutil.parser
 import types
 import inspect
 import operator
-from enum import Enum
+from enum import IntEnum
 import sqlite3
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import networkx as nx
 import dill
@@ -38,16 +27,17 @@ except:
 # RMS Update events
 ###################################
 
-class RMSUpdateEvent(Enum):
+class RMSUpdateEvent(IntEnum):
 	MODIFY = 1
 	INSERT = 2
 	DELETE = 3
 	CONTENTCHANGE = 4
+	REPLACE = 5
 	
 ###################################
 # RMS Entries and related classes
 ###################################
-class RMSEntryType(Enum):
+class RMSEntryType(IntEnum):
 	NONRMSENTRY = 0
 	PIPE = 1
 	RESOURCE = 2
@@ -107,6 +97,14 @@ class Task(RMSEntry):
 		return RMSEntryType.TASK	
 	def get_id(self):
 		return self.tid
+	
+class UnrunTaskState(IntEnum):
+	EDIT = 0
+	LOCKED = 1
+	PENDING = 2
+	RUNNING = 3
+	COMPLETE = 4
+	ERROR = 5
 class UnrunTask(RMSEntry):
 	'''
 	return_values could be None if not specified. 
@@ -133,6 +131,7 @@ class UnrunTask(RMSEntry):
 		self.fileresource_tags = fileresource_tags
 		self.fileresource_info = fileresource_info
 		self.replacement = None
+		self.state = UnrunTaskState.EDIT
 	@property
 	def input_pipes(self):
 		return [arg for arg in self.ba.args if isinstance(arg, Pipe)] + [arg for arg in self.ba.kwargs.values() if isinstance(arg, Pipe)]		
@@ -170,7 +169,10 @@ class UnrunTask(RMSEntry):
 		except TypeError:
 			return False
 		return True
-	
+class UnrunTaskParam:
+	pass	
+	# Remove associated parameter
+	 
 def _invalid_func():
 	'''
 	An indicator for invalid function when loading pipe from database.
@@ -179,19 +181,41 @@ def _invalid_func():
 
 class Pipe(RMSEntry):
 	#def __init__(self, pid, func, return_tuple, return_volatile, output_func, is_deterministic, description, tags, info, rmsp):
-	def __init__(self, pid, func, return_volatile, is_deterministic, module_name, func_name, output_func, description, tags, info, rms):
+	def __init__(self, pid, func_str, return_volatile, is_deterministic, module_name, func_name, output_func_str, description, tags, info, rms):
 		self.pid = pid
-		self.func = func 
+		self._func_str = func_str
 		self.return_volatile = return_volatile
 		self.is_deterministic = is_deterministic
 		self.module_name = module_name
 		self.func_name = func_name		
-		self.output_func = output_func
+		self._output_func_str = output_func_str
 		self.description = description
 		self.tags = tags
 		self.info = info
 		self.rms = rms
-
+		self._func = None
+		self._output_func = None
+	
+	@property
+	def func(self):
+		if self._func is None:
+			try:
+				self._func = dill.loads(bytes.fromhex(self._func_str))
+			except:
+				self._func = _invalid_func
+		return self._func
+	@property
+	def output_func(self):
+		if self._output_func_str is None:
+			self._output_func = None
+		elif self._output_func is None:
+			try: 
+				self._output_func = dill.loads(bytes.fromhex(self._output_func_str))
+			except:
+				self._output_func = _invalid_func
+		return self._output_func
+			
+			
 	def __call__(self, *args, **kwargs):
 		return self.rms.run(self, args, kwargs)
 	def get_type(self):
@@ -199,6 +223,15 @@ class Pipe(RMSEntry):
 	
 	def get_id(self):
 		return self.pid
+	def __getstate__(self):
+		d = dict(self.__dict__)
+		d.pop("rms")
+		return d
+	def __setstate__(self, d):
+		d = dict(d)
+		d["rms"] = None
+		self.__dict__ = d
+	
 class Resource(RMSEntry):
 	def __init__(self, rid, tid, volatile, description, tags, info, content=None, has_content=True):
 		self.rid = rid
@@ -257,22 +290,46 @@ class FileResource(RMSEntry):
 		return self.fid
 
 class VirtualResource(RMSEntry):
-	def __init__(self, vid, tid, volatile, description, tags, info):
+	def __init__(self, vid, file_path=None):
 		self.vid = vid
+		self.uid = None
 		self.replacement = None
+		self.file_path = file_path
 	def get_type(self):
 		return RMSEntryType.VIRTUALRESOURCE	
 		
 	def get_id(self):
 		return self.vid
 	
+# class VirtualFileResource(VirtualResource):
+# 	def __init__(self, vid, file_path):
+# 		super().__init__(vid)
+# 		self.file_path = file_path
+		
 class ResourceNotReadyException(Exception):
 	'''
 	An exception that is called when accessing a resource without content.
 	'''
 	pass
 	
-	
+class RMSTemplate():
+	pass
+class RMSLibrary():
+	pass
+class RMSTemplateJobStatus(IntEnum):
+	PENDING = 0
+	RUNNING = 1
+	COMPLETE = 2
+	ERROR = 3
+class RMSTemplateJob():
+	def __init__(self, tpid, func, args, kwargs):
+		self.tpid = tpid
+		self.func = func
+		self.args = args
+		self.kwargs = kwargs
+		self.status = RMSTemplateJobStatus.PENDING
+		self.unruntasks = []
+		self.tasks = []
 class VirtualModule():
 	'''
 	A virtual class to hold the imported module
@@ -520,8 +577,160 @@ def _get_file_md5(f):
 	except:
 		return None
 	
+#####################################
+# Template Simulator
+#####################################	
+class TemplateSimulationResult:
+	def __init__(self, rfdb, vfdb, unruntasks_db, virtualresources_db, pipes_db):
+		self.rfdb = rfdb
+		self.vfdb = vfdb
+		self.unruntasks_db = unruntasks_db
+		self.virtualresources_db = virtualresources_db
+		self.pipes_db = pipes_db
+		
+class TemplateSimulator:
+	def __init__(self):
+		self.rfdb = {}
+		self.vfdb = {}
+		self.unruntasks_db = {}
+		self.virtualresources_db = {}
+		self.pipes_db = {}
+		
+	def _get_new_id(self):
+		return uuid.uuid4().hex
+		
+	def create_virtualfileresource(self, file_path):
+		vid = self._get_new_id()
+		vr = VirtualResource(vid, file_path=file_path)
+		self.vfdb[file_path] = vr
+		self.virtualresources_db[vid] = vr 
+		return vr
+	def create_virtualresource(self,):
+		vid = self._get_new_id()
+		vr = VirtualResource(vid)
+		self.virtualresources_db[vid] = vr
+		return vr
 	
+	def create_unruntask(self, pid, args=[], kwargs={}, return_values=[], output_files=[],
+						task_description="", task_tags=set(), task_info={},
+						resource_description="", resource_tags=set(), resource_info={}, 
+						fileresource_description="", fileresource_tags=set(), fileresource_info={}):
+		uid = self._get_new_id()
+		pipe = self.get_pipe(pid)
+		ba = _get_func_ba(pipe.func, args, kwargs, partial=True)
+		ut = UnrunTask(uid, pid, ba, return_values, output_files,
+					task_description, task_tags, task_info,
+					resource_description, resource_tags, resource_info,
+					fileresource_description, fileresource_tags, fileresource_info
+					)
+		
+		for vr in return_values:
+			vr.uid = uid
+		if output_files is not None:
+			for vr in output_files:
+				vr.uid = uid
+		self.unruntasks_db[uid] = ut
+		return ut
+		
 	
+	def register_file(self, file_path):
+		file_path = os.path.abspath(file_path)
+		if file_path in self.rfdb:
+			return self.rfdb[file_path]
+		else:
+			vr = self.create_virtualfileresource(file_path)
+		self.rfdb[file_path] = vr
+		return vr
+	
+	def file_from_path(self, file_path):
+		file_path = os.path.abspath(file_path)
+		if file_path in self.vfdb:
+			return self.vfdb[file_path]
+		else:
+			vr = self.create_virtualfileresource(file_path)
+		self.vfdb[file_path] = vr
+		return vr
+	
+	def register_pipe(self, func, return_volatile=False, is_deterministic=True, output_func=None, description="", tags={}, pid=None, force=False):
+		if not callable(func):
+			raise Exception("func is not callable, and cannot be registered")
+		info = {}
+		if func.__module__ == "__main__":
+			try:
+				info["sourcecode"] = inspect.getsource(func)
+			except:
+				pass
+			func.__code__ = _modify_func_code(func.__code__)
+		if output_func is not None:
+			if output_func.__module__ == "__main__":
+				try:
+					info["outputfunc_sourcecode"] = inspect.getsource(output_func)
+				except:
+					pass
+				output_func.__code__ = _modify_func_code(output_func.__code__)
+# 		print(func)
+		e = dill.dumps(func)
+# 		print(e)
+		func = dill.loads(e)
+		func_name = func.__name__
+		module_name = func.__module__
+
+		pid = self._get_new_id()
+		pipe = Pipe(pid, dill.dumps(func).hex(), return_volatile, is_deterministic, module_name, func_name, None if output_func is None else dill.dumps(output_func).hex(), description, tags, info, self)
+		self.pipes_db[pid] = pipe
+		return pipe
+	
+	def get_pipe(self, pid):
+		return self.pipes_db[pid]
+	
+	def run(self, pipe, args=(), kwargs={},
+		   task_description="", task_tags=set(), task_info={},
+				resource_description="", resource_tags=set(), resource_info={}, 
+				fileresource_description="", fileresource_tags=set(), fileresource_info={}):
+		uid = self._get_new_id()
+# 		print(uid)
+# 		ba = _get_func_ba(pipe.func, args, kwargs, partial=True)
+		vr = self.create_virtualresource()
+		if pipe.output_func is not None:
+			try:
+				def convert(arg):
+					if isinstance(arg, VirtualResource) or isinstance(arg, FileResource):
+						if arg.file_path is not None:
+							return arg.file_path
+						else:
+							return arg
+					elif isinstance(arg, Pipe):
+						return arg.func
+					else:
+						return arg
+				tmp_args = [convert(arg) for arg in args]
+				tmp_kwargs = {key:convert(arg) for key, arg in kwargs.items()}
+				# print(tmp_args, tmp_kwargs)
+				
+				virtual_output_files = pipe.output_func(*tmp_args, **tmp_kwargs)
+				virtual_vrs = []
+				for file_path in virtual_output_files: 
+					file_path = os.path.abspath(file_path)
+					if file_path in self.vfdb:
+						tvr = self.vfdb[file_path]
+					else:
+						tvr = self.create_virtualfileresource(file_path)
+						self.vfdb[file_path] = tvr
+					virtual_vrs.append(tvr)
+			except:
+				print("BAD")
+				virtual_vrs = []
+		
+		u = self.create_unruntask(pipe.pid, args, kwargs, [vr], virtual_vrs,
+									task_description, task_tags, task_info,
+									resource_description, resource_tags, resource_info,
+									fileresource_description, fileresource_tags, fileresource_info
+									)
+		self.unruntasks_db[u.uid] = u
+		return vr
+
+	def get_result(self):
+		return TemplateSimulationResult(self.rfdb, self.vfdb, self.unruntasks_db, self.virtualresources_db, self.pipes_db)
 #####################################
 # RMS
 #####################################	
@@ -541,12 +750,13 @@ class ResourceManagementSystem():
 		self.fileresources_db = {}
 		self.unruntasks_db = {}
 		self.virtualresources_db = {}
+# 		self.virtualfileresources_db = {}
 		self.resource_dump_dir = resource_dump_dir
 		self.tokens = {}
 		self.rms_update_listeners = []
 		self.vm = VirtualModule()
 		self.scriptID = None
-		
+		self.allow_overwrite = False
 	############
 	# RMS Info #
 	############
@@ -583,7 +793,26 @@ class ResourceManagementSystem():
 				_load_resource_content(self.resource_dump_dir, resource)
 			except:
 				if autofetch:
-					self.auto_fetch_resource_content([resource])
+					# self.auto_fetch_resource_content([resource])
+					if not resource.has_content:
+						if resource.tid is None:
+							raise Exception("Fail. Unable to retrieve resource tid.")
+						task = self.get_task(resource.tid)
+						pipe = self.get_pipe(task.pid)
+						if not pipe.is_deterministic:
+							raise Exception("Fail. Unable to rerun pipe because it is a non-deterministic pipe.")
+						if not len(task.output_files) == 0:
+							raise Exception("Fail. Re-retrieving the content may overwrite certain files.")
+						if any(not os.path.exists(f.file_path) for f in task.input_fileresources):
+							raise Exception("Fail. Some files are missing")
+						for sub_resource in task.input_resources:
+							self._obtain_resource_content(sub_resource, autofetch)
+						raw_return_value = self._run_pipe(pipe, task.args, task.kwargs)
+						resource.content = raw_return_value
+						self.fireRMSUpdateEvent([(RMSUpdateEvent.CONTENTCHANGE, resource.get_full_id())])
+					
+					
+					
 				else:
 					raise Exception("Resource content not available for " + resource.rid)
 		return resource.content
@@ -643,6 +872,8 @@ class ResourceManagementSystem():
 				output_func.__code__ = _modify_func_code(output_func.__code__)
 		
 		func = dill.loads(dill.dumps(func))
+		if output_func is not None:
+			output_func = dill.loads(dill.dumps(output_func))
 		func_name = func.__name__
 		module_name = func.__module__
 		c = self.sql.cursor()
@@ -658,14 +889,16 @@ class ResourceManagementSystem():
 					and ((old_pipe.output_func is None and output_func is None)
 						or (old_pipe.output_func is not None and output_func is not None and dill.dumps(old_pipe.output_func).hex() == dill.dumps(output_func).hex()))):
 					return old_pipe
-				
 		if pid is None:
 			pid = self._get_new_id()
-		pipe = Pipe(pid, func, return_volatile, is_deterministic, module_name, func_name, output_func, description, tags, info, self)
+		pipe = Pipe(pid, dill.dumps(func).hex(), return_volatile, is_deterministic, module_name, func_name, None if output_func is None else dill.dumps(output_func).hex(), description, tags, info, self)
 		_sql_execute_commands(self.sql, _sql_insert_pipe(pipe))
 		self.pipes_db[pid] = pipe
 		self.fireRMSUpdateEvent([(RMSUpdateEvent.INSERT, pipe.get_full_id())])
 		return pipe
+	
+# 	def drp(self, return_volatile=False, is_deterministic=True, output_func=None, description="", tags={}, pid=None, force=False):
+# 		return lambda func: self.register_pipe(func, return_volatile, is_deterministic, output_func, description, tags, pid, force)
 	
 	def register_file(self, file_path, *, description="", tags=set(), tid=None, fid=None, force=False):
 		'''
@@ -713,7 +946,7 @@ class ResourceManagementSystem():
 		results = [fid for fid, in raw_results if "overwritten" not in self.get_fileresource(fid).info and "deprecated" not in self.get_fileresource(fid).info]
 		if len(results) > 0:
 			if len(results) > 1:
-				raise Exception("Found more than one file.")
+				raise Exception("Found more than one file." + ",".join(results))
 			fid = results[-1]
 			return self.get_fileresource(fid)
 		else:
@@ -888,6 +1121,11 @@ class ResourceManagementSystem():
 			objs = rmsobj.input_resources + rmsobj.input_fileresources + rmsobj.input_pipes + rmsobj.input_virtualresources
 		elif rmsobj.get_type() == RMSEntryType.VIRTUALRESOURCE:
 			objs = [unruntask for unruntask in self.unruntasks_db.values() if rmsobj in unruntask.output_virtualresources]
+			
+			#if rmsobj.file_path is not None:
+				#potential_unruntasks = [unruntask for unruntask in self.unruntasks_db.values() if rmsobj.file_path in self._guess_unruntask_output(unruntask)]
+				#potential_unruntasks = [unruntask for unruntask in self.unruntasks_db.values() if rmsobj.file_path in unruntask.output_file]
+				#objs += [r for r in potential_unruntasks if r not in objs] 
 		elif rmsobj.get_type() == RMSEntryType.PIPE:
 			objs = []
 		else:
@@ -899,21 +1137,29 @@ class ResourceManagementSystem():
 	def _get_next_downstream_objs(self, rmsobj, target_rmsobjs=None):
 		target_tids = None if target_rmsobjs is None else [rmsobj.tid for rmsobj in target_rmsobjs if rmsobj.get_type() == RMSEntryType.TASK]
 		if rmsobj.get_type() == RMSEntryType.FILERESOURCE:
-			objs = self.find_tasks_by_io(iotype="i", fids=[rmsobj.fid], target_tids=target_tids)
+			objs = self.find_tasks_by_io(iotype="i", fids=[rmsobj.fid], target_tids=target_tids) + [unruntask for unruntask in self.unruntasks_db.values() if rmsobj in unruntask.input_fileresources]
 		elif rmsobj.get_type() == RMSEntryType.RESOURCE:
 			objs = self.find_tasks_by_io(iotype="i", rids=[rmsobj.rid], target_tids=target_tids) + [unruntask for unruntask in self.unruntasks_db.values() if rmsobj in unruntask.input_resources]
+			
 		elif rmsobj.get_type() == RMSEntryType.TASK:
 			objs = rmsobj.output_resources + rmsobj.output_fileresources
 		elif rmsobj.get_type() == RMSEntryType.UNRUNTASK:
 			objs = rmsobj.output_resources + rmsobj.output_fileresources + rmsobj.output_virtualresources
+			file_paths = [obj.file_path for obj in objs if obj.file_path is not None]
+# 			file_paths += self._guess_unruntask_output(rmsobj)
+			file_paths = set(file_paths)
+			potential_vrs = [virtualresource for virtualresource in self.virtualresources_db.values() if virtualresource.file_path is not None and virtualresource.file_path in file_paths]
+			objs += [v for v in potential_vrs if v not in objs]
 		elif rmsobj.get_type() == RMSEntryType.VIRTUALRESOURCE:
 			objs = [unruntask for unruntask in self.unruntasks_db.values() if rmsobj in unruntask.input_virtualresources]
 		elif rmsobj.get_type() == RMSEntryType.PIPE:
 			objs = self.find_tasks_by_io(iotype="i", pids=[rmsobj.pid], target_tids=target_tids) + [unruntask for unruntask in self.unruntasks_db.values() if rmsobj in unruntask.input_pipes]
 		else:
 			raise Exception()
+		#for i in self.unruntasks_db.values()
 		if target_rmsobjs is not None:
 			objs = [rmsobj for rmsobj in objs if rmsobj in target_rmsobjs]
+			
 		return objs
 	def _get_next_connected_objs(self, rmsobj, target_rmsobjs=None):
 		return set(self._get_next_upstream_objs(rmsobj, target_rmsobjs) + self._get_next_downstream_objs(rmsobj, target_rmsobjs))
@@ -977,34 +1223,34 @@ class ResourceManagementSystem():
 			r[6],
 			r[7]
 		)
-		try:
-			
-			func = dill.loads(bytes.fromhex(func_str))
-		except:
-			func = _invalid_func
-		if output_func_str is None:
-			output_func = None
-		else:
-			try: 
-				output_func = dill.loads(bytes.fromhex(output_func_str))
-			except:
-				output_func = _invalid_func
+# 		try:
+# 			func = dill.loads(bytes.fromhex(func_str))
+# 		except:
+# 			func = _invalid_func
+# 		if output_func_str is None:
+# 			output_func = None
+# 		else:
+# 			try: 
+# 				output_func = dill.loads(bytes.fromhex(output_func_str))
+# 			except:
+# 				output_func = _invalid_func
 		tags = set(tag_value for tag_value, in tags_results)
 		info = {k:v for k, v in info_results}
 		if pid in self.pipes_db:
-			pipe = self.pipes_db[pid]
-			pipe.pid=pid
-			pipe.func=func
-			pipe.return_volatile=return_volatile
-			pipe.is_deterministic=is_deterministic
-			pipe.output_func=output_func
-			pipe.module_name = module_name
-			pipe.func_name = func_name
-			pipe.description=description
-			pipe.tags=tags
-			pipe.info=info
+			raise Exception()
+# 			pipe = self.pipes_db[pid]
+# 			pipe.pid=pid
+# 			pipe.func=func
+# 			pipe.return_volatile=return_volatile
+# 			pipe.is_deterministic=is_deterministic
+# 			pipe.output_func=output_func
+# 			pipe.module_name = module_name
+# 			pipe.func_name = func_name
+# 			pipe.description=description
+# 			pipe.tags=tags
+# 			pipe.info=info
 		else:
-			pipe = Pipe(pid, func, return_volatile, is_deterministic, module_name, func_name, output_func, description, tags, info, self)
+			pipe = Pipe(pid, func_str, return_volatile, is_deterministic, module_name, func_name, output_func_str, description, tags, info, self)
 			self.pipes_db[pipe.pid] = pipe
 		return pipe
 	
@@ -1064,7 +1310,7 @@ class ResourceManagementSystem():
 		c.execute('''SELECT tid FROM tasks_outputfiles where fid = ?;''', [fid])
 		task_results = c.fetchall()
 		if len(results) != 1:
-			raise Exception()
+			raise Exception("Error in getting files: " + fid)
 		if len(task_results) > 1:
 			raise Exception()
 		elif len(task_results) == 1:
@@ -1104,7 +1350,6 @@ class ResourceManagementSystem():
 		results = c.fetchall()
 		if len(results) != 1:
 			raise Exception()
-
 		c.execute('''SELECT tag_value FROM task_tags where tid = ?;''', [tid])
 		tags_results = c.fetchall()
 		c.execute('''SELECT info_key, info_value FROM task_info where tid = ?;''', [tid])
@@ -1253,17 +1498,16 @@ class ResourceManagementSystem():
 		output_file_paths = [os.path.abspath(path) for path in output_file_paths] 
 		return output_file_paths
 	
+	def exist_output_files(self, output_files):
+		overlapped_fids = []
+		for output_file in output_files:
+			c = self.sql.cursor()
+			c.execute('''SELECT fid FROM files where file_path = ?;''', [output_file])
+			overlapped_fids.extend([fid for fid, in c.fetchall()])
+		return len(overlapped_fids) > 0
 	
-	
-	def register_finished_task(self, raw_return_value, begin_time, end_time, ba, pipe, 
-							task_description="", task_tags=[], task_info={},
-							resource_description="", resource_tags=[], resource_info={},
-							fileresource_description="", fileresource_tags=[], fileresource_info={}):
-		'''
-		Register a finished task, assuming the task has completed successfully. 
-		'''
+	def _compile_files_md5_from_pipe_ba(self, pipe, ba):
 		func_args, func_kwargs = self._ba_rms_to_func_args_kwargs(ba)
-		
 		# Check for output files
 		output_file_paths = pipe.output_func(*func_args, **func_kwargs) if pipe.output_func is not None else []
 		output_file_paths = [os.path.abspath(path) for path in output_file_paths] 
@@ -1272,7 +1516,32 @@ class ResourceManagementSystem():
 			print("Warning: the following output files are not detected:")
 			print(problematic_paths)
 			output_file_paths = [p for p in output_file_paths if os.path.exists(p)]
-			
+		return OrderedDict([[file_path,_get_file_md5(file_path)] for file_path in output_file_paths])
+	def register_finished_task(self, raw_return_value, begin_time, end_time, ba, pipe, 
+							task_description="", task_tags=[], task_info={},
+							resource_description="", resource_tags=[], resource_info={},
+							fileresource_description="", fileresource_tags=[], fileresource_info={},
+							precompiled_files_md5=None
+							):
+		'''
+		Register a finished task, assuming the task has completed successfully. 
+		'''
+# 		func_args, func_kwargs = self._ba_rms_to_func_args_kwargs(ba)
+# 		
+# 		# Check for output files
+# 		output_file_paths = pipe.output_func(*func_args, **func_kwargs) if pipe.output_func is not None else []
+# 		output_file_paths = [os.path.abspath(path) for path in output_file_paths] 
+# 		problematic_paths = [p for p in output_file_paths if not os.path.exists(p)]
+# 		if len(problematic_paths) > 0:
+# 			print("Warning: the following output files are not detected:")
+# 			print(problematic_paths)
+# 			output_file_paths = [p for p in output_file_paths if os.path.exists(p)]
+# 			
+		if precompiled_files_md5 is None:
+			file_path_md5_dict = self._compile_files_md5_from_pipe_ba(pipe, ba)
+		else:
+			file_path_md5_dict = precompiled_files_md5
+		output_file_paths = list(file_path_md5_dict.keys())
 		return_value_rid = self._get_new_id()
 		output_file_fids = [self._get_new_id() for _ in output_file_paths]
 		tid = self._get_new_id()
@@ -1280,8 +1549,8 @@ class ResourceManagementSystem():
 		# Create resource, fileresource and task
 		new_resources = [Resource(return_value_rid, tid, pipe.return_volatile, resource_description, resource_tags, resource_info, raw_return_value)]
 		
-		new_fileresources = [FileResource(fid, tid, file_path, _get_file_md5(file_path), fileresource_description, fileresource_tags, fileresource_info) for fid, file_path in zip(output_file_fids, output_file_paths)]
-
+# 		new_fileresources = [FileResource(fid, tid, file_path, _get_file_md5(file_path), fileresource_description, fileresource_tags, fileresource_info) for fid, file_path in zip(output_file_fids, output_file_paths)]
+		new_fileresources = [FileResource(fid, tid, file_path, file_path_md5_dict[file_path], fileresource_description, fileresource_tags, fileresource_info) for fid, file_path in zip(output_file_fids, output_file_paths)]
 		task = Task(tid, pipe.pid, ba.args, ba.kwargs, new_resources, new_fileresources, begin_time, end_time, task_description, task_tags, task_info)
 		
 		# Find files that are overwritten
@@ -1355,7 +1624,10 @@ class ResourceManagementSystem():
 		
 		# Generate output files, this step ensures that the output func works 
 		output_files = self.compute_output_files(pipe, func_args, func_kwargs)
-		
+		if not self.allow_overwrite:
+			if self.exist_output_files(output_files):
+				raise Exception()
+
 		# Add task info
 		if self.scriptID is not None:
 			task_info = {"scriptid":self.scriptID, **task_info}
@@ -1384,10 +1656,12 @@ class ResourceManagementSystem():
 	def replace_virtualresource(self, virtualresource, resource):
 		'''
 		Replace a virtual resource with the desired resource.
+		Can also replace a virtual filresource with the desired fileresource
 		
 		Should change it to use replace_unruntask_rmsobj 
 		'''
 		virtualresource.replacement = resource
+		self.fireRMSUpdateEvent([(RMSUpdateEvent.REPLACE, virtualresource.get_full_id())])
 		for unruntask in self.find_downstream_objs([virtualresource], 1):
 			original_kv = list(unruntask.ba.arguments.items())
 			for k, v in original_kv:
@@ -1399,7 +1673,8 @@ class ResourceManagementSystem():
 					if isinstance(v, RMSEntry):
 						if v is virtualresource:
 							unruntask.ba.arguments[k] = resource
-		self.delete(virtualresource.get_full_id())
+		#Temp disable
+# 		self.delete(virtualresource.get_full_id())
 		
 	def replace_unruntask(self, unruntask, task):
 		'''
@@ -1413,9 +1688,12 @@ class ResourceManagementSystem():
 			if len(task.output_files) == len(unruntask.output_files):
 				for vr, r in zip(unruntask.output_files, task.output_files):
 					self.replace_virtualresource(vr, r)
+					
 		
 		unruntask.replacement = task
-		self.delete(unruntask.get_full_id())
+		self.fireRMSUpdateEvent([(RMSUpdateEvent.REPLACE, unruntask.get_full_id())])
+		# Temp disable
+		#self.delete(unruntask.get_full_id())
 
 	def run_unruntask(self, unruntask):
 		pipe = self.get_pipe(unruntask.pid)
@@ -1438,6 +1716,32 @@ class ResourceManagementSystem():
 		
 		self.replace_unruntask(unruntask, task)
 		return task.return_values[0]
+	
+	def create_template_job(self, func, args, kwargs):
+		tpid = self._get_new_id()
+		return RMSTemplateJob(tpid, func, args, kwargs)
+	
+	def run_template_job(self, template_job):
+		'''
+		This involves running multiple steps in a function
+		'''
+		template_job.status = RMSTemplateJobStatus.RUNNING
+# 		try:
+		template_job.func(self, *template_job.args, **template_job.kwargs)
+		template_job.status = RMSTemplateJobStatus.COMPLETE
+		return template_job 
+# 		except:
+# 			print("Here")
+# 			template_job.status = RMSTemplateJobStatus.ERROR
+		
+	def run_template(self, func, args=[], kwargs={}):
+		job = self.create_template_job(func, args, kwargs)
+		return self.run_template_job(job)
+		
+	def simulate_template(self, func, args=[], kwargs={}):
+		simulator = TemplateSimulator()
+		func(simulator, *args, **kwargs)
+		return simulator.get_result()
 	
 	def run_unruntask_chain(self, unruntask):
 		for vr in unruntask.input_virtualresources:
@@ -1489,9 +1793,15 @@ class ResourceManagementSystem():
 					fileresource_description, fileresource_tags, fileresource_info
 					)
 		
-				
+		for vr in return_values:
+			vr.uid = uid
+		if output_files is not None:
+			for vr in output_files:
+				vr.uid = uid
 		self.unruntasks_db[uid] = ut
+		self.fireRMSUpdateEvent([(RMSUpdateEvent.INSERT, ut.get_full_id())])
 		return ut
+	
 	def create_unruntask_from_task(self, task, return_values=[], output_files=[]):
 		uid = self._get_new_id()
 		ba = _get_func_ba(self.get_pipe(task.pid).func, task.args, task.kwargs, partial=True)
@@ -1500,8 +1810,15 @@ class ResourceManagementSystem():
 		return unruntask
 	def create_virtualresource(self):
 		vid = self._get_new_id()
-		vr = VirtualResource(vid, None, None, None, None, None)
+		vr = VirtualResource(vid)
 		self.virtualresources_db[vid] = vr
+		self.fireRMSUpdateEvent([(RMSUpdateEvent.INSERT, vr.get_full_id())])
+		return vr
+	def create_virtualfileresource(self, file_path):
+		vid = self._get_new_id()
+		vr = VirtualResource(vid, file_path)
+		self.virtualresources_db[vid] = vr
+		self.fireRMSUpdateEvent([(RMSUpdateEvent.INSERT, vr.get_full_id())])
 		return vr
 	def create_unruntask_chain(self, args):
 		rmsobjs = list(map(self._as_rmsobj, args))
@@ -1563,7 +1880,27 @@ class ResourceManagementSystem():
 		self.fireRMSUpdateEvent([(RMSUpdateEvent.INSERT, rmsobj.get_full_id()) for rmsobj in newobjs])
 		return newobjs
 					
-	
+	def _guess_unruntask_output(self, unruntask):
+		'''
+		Based on the current parameter of unruntask, guess the output of the unruntask by adding default or None to missing parameters
+		'''
+		if self.get_pipe(unruntask.pid).output_func is None:
+			return []
+		ba = unruntask.ba.signature.bind_partial(*unruntask.ba.args, **unruntask.ba.kwargs)
+		for p, param in unruntask.ba.signature.parameters.items():
+			if param.kind == inspect.Parameter.VAR_POSITIONAL or param.kind == inspect.Parameter.VAR_KEYWORD:
+				continue
+			if p not in ba.arguments:
+				if param.default is param.empty:
+					ba.arguments[p] = None
+				else:
+					ba.arguments[p] = param.default
+		try:
+			potential_output_files = self.get_pipe(unruntask.pid).output_func(*ba.args, **ba.kwargs)
+			return potential_output_files
+		except:
+			return []
+		
 	def mark_deprecated(self, rmsobj, mark_downstream=True):
 		'''
 		Mark a rmsobj as deprecated. 
@@ -1741,7 +2078,7 @@ class ResourceManagementSystem():
 
 		# There are two ways to add bound_method. 
 		# 1. If the class is already registered, set the bound method as the class attr
-		# 2. If the class is not registered, set the class as another virtual module 
+		# 2. If the class is not registered, set the class as another virtual module
 		bound_method_classes = defaultdict(list)
 		for p in pipes:
 			if inspect.ismethod(p.func):
@@ -1801,7 +2138,6 @@ class ResourceManagementSystem():
 								setattr(to_add[i], bound_method.func.__name__, bound_method)
 				namespace[altname] = types.SimpleNamespace(**d, **to_add)
 				returnvalue = namespace[altname]
-
 				
 		# Import the variable
 		else:
@@ -2106,8 +2442,8 @@ class ResourceManagementSystem():
 		print("###########")
 		print("# Imports #")
 		print("###########")
-		print(f"from rpms import newrms")
-		print(f'rmsp = newrms.ResourceManagementSystem("/local/storage/kl945/RMS/New_RMS.db", "/local/storage/kl945/RMS/")')
+		print(f"from rmsp import rmscore")
+		print(f'rmsp = rmscore.ResourceManagementSystem("/path/to/test.db", "/path/to/")')
 		print()
 		print("#############")
 		print("# Pipelines #")

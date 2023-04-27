@@ -16,21 +16,11 @@ RMS record most common python functions and objects, and avoid duplicated jobs. 
 
 Rebuilding an entire analysis into the new system is usually a big hurdle, but not in RMS. RMS provides a simple solution - you can keep using most of your codes in the main body. The only thing to do is to change the import functions.
 
-### Flexible interface for both programmers and non-programmers
 
-TBW
-
-### Multi-processing support on different tasks
-
-TBW
 
 ### Easy but powerful search
 
 Many systems allow you to find out an upstream file required to generate the results. However, not all systems allow more complicated search. For example, can we search for the results based on some input file 1 and input file 2, processed through either pipeline X with the parameter A or pipeline Y with parameter B? Can we find out peak files using peak calling software J with alignment based on alignment software K? RMS enables these searches so that you can always retrieve your results quickly
-
-### Tracking multiple conda environment in bash
-
-TBW
 
 ### Easy Backup / Restore
 
@@ -47,7 +37,7 @@ Since RMS uses the absolute path to link to a file, users could easily access th
 To install Resource Management System, use the following:
 
 ```python
-pip install resource_management_system
+pip install rmsp
 ```
 
 
@@ -551,19 +541,7 @@ rmsutils.restore('src_path', 'target_path')
 
 ## User Guide - GUI
 
-The GUI is useful to visualize all your tasks, files and resources. It allows instant analysis to certain variables. The template system also allows you to run simple analysis if you are unfamiliar with coding. 
-
-TBW
-
-### Template
-
-TBW
-
-### Extension
-
-TBW
-
-
+The GUI is useful to visualize all your tasks, files and resources. It allows instant analysis to certain variables. The template system also allows you to run simple analysis if you are unfamiliar with coding.  Please refer to rmsp-gui for details
 
 ## FAQ / Important Notes
 

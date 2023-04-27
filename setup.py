@@ -3,11 +3,11 @@ from setuptools import setup, find_packages
 with open("README.md", "r") as readme_file:
 	readme = readme_file.read()
 
-requirements = ["python-dateutil", "dill", "networkx"]
+requirements = ["python-dateutil", "dill", "networkx", "psutil", "requests"]
 
 setup(
 	name="rmsp",
-	version="0.0.1",
+	version="0.0.9",
 	author="Alden Leung",
 	author_email="alden.leung@gmail.com",
 	description="Resource management system for python",

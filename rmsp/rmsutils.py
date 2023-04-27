@@ -1,8 +1,3 @@
-'''
-Created on Aug 7, 2021
-
-@author: kl945
-'''
 
 import os
 import shutil
@@ -447,7 +442,7 @@ def _read_meta_info(metainfo_file):
 		
 		
 		
-def export_files_to_directory(self, o, *target_files, directorymode='common', rootdirectory='.',):
+def export_files_to_directory(self, o, *target_files, directorymode='common', rootdirectory='.', override_deprecated_files=False):
 	'''
 	Export files from a database to the target directory. 
 	
@@ -459,6 +454,7 @@ def export_files_to_directory(self, o, *target_files, directorymode='common', ro
 	frs = [self.file_from_path(f) for f in target_files]
 	abspaths = [fr.file_path for fr in frs]
 	
+	print(f"Checking {len(target_files)} files...")
 	# Compile relative path for target_files
 	target_file_dict = None
 	if directorymode == 'common':
@@ -482,6 +478,7 @@ def export_files_to_directory(self, o, *target_files, directorymode='common', ro
 	f = os.path.abspath(o + "/" + "RMS_metainfo.txt")
 	if os.path.exists(f):
 		old_dbid, old_entries = _read_meta_info(f)
+		print(f"There are {len(old_entries)} old entries exported.")
 		if old_dbid != dbid:
 			raise Exception(f"The DB IDs are different: {old_dbid} and {dbid}")
 	else:
@@ -497,7 +494,22 @@ def export_files_to_directory(self, o, *target_files, directorymode='common', ro
 		if fid in old_entries:
 			ofname, ofmd5, ofid = old_entries[fid]
 			if fname != ofname or fmd5 != ofmd5:
-				raise Exception(f"Inconsistent file: {fid}")
+				raise Exception(f"Inconsistent file: {fid}" + f"\n{fname}, {ofname}, {fmd5}, {ofmd5}")
+	
+	# Check for deprecated, overlapping entries (by file path)
+	deprecated_entries_to_replace = {} # (old fid: new fid)
+	old_entries_by_fname = {ofname: (ofname, ofmd5, ofid) for ofname, ofmd5, ofid in old_entries.values()}
+	for fname, fmd5, fid in entries.values():
+		if fid not in old_entries:
+			if fname in old_entries_by_fname:
+				ofid = old_entries_by_fname[fname][2]
+				if "overwritten" in self.get_fileresource(ofid).info or "deprecated" in self.get_fileresource(ofid).info: 
+					deprecated_entries_to_replace[ofid] = fid
+	if len(deprecated_entries_to_replace) > 0:
+		if not override_deprecated_files:
+			raise Exception("Deprecated files exist. Change override_deprecated_files to True if you want to replace the entries\n" + "\n".join([old_entries[ofid][0] for ofid in deprecated_entries_to_replace])) 
+		print(f"There are {len(deprecated_entries_to_replace)} deprecated/overwritten files to be replaced...")
+		
 	# Create the metainfo file
 	metainfo_file = tempfile.NamedTemporaryFile(mode='w+', suffix=".txt", delete=False).name
 	with open(metainfo_file, 'w') as fw:
@@ -505,6 +517,8 @@ def export_files_to_directory(self, o, *target_files, directorymode='common', ro
 		fw.write(f"#File\tMD5\tRMS_File_ID\n")
 		
 		for fname, fmd5, fid in old_entries.values():
+			if fid in deprecated_entries_to_replace:
+				continue
 			fw.write(f"{fname}\t{fmd5}\t{fid}\n")
 		for fname, fmd5, fid in entries.values():
 			if fid in old_entries:
@@ -518,21 +532,26 @@ def export_files_to_directory(self, o, *target_files, directorymode='common', ro
 	# Update the target file dict
 	target_file_dict = {target_file: os.path.abspath(o + "/" + alt_file_name) for target_file, alt_file_name in target_file_dict.items()}
 	
-	# Check if file exists
+	
+	# Check if file exists to avoid overwritting important files. 
+	# Deprecated files to be replaced do not count towards existing files.
+	if len(deprecated_entries_to_replace) > 0:
+		fids_to_replace_deprecated_entries = set(deprecated_entries_to_replace.values())
+	else:
+		fids_to_replace_deprecated_entries = set()
 	existing_files = []
 	for fr in frs:
 		if fr.fid in old_entries:
 			target_file_dict.pop(fr.file_path)
 		else:
 			if os.path.exists(target_file_dict[fr.file_path]):
-				existing_files.append(target_file_dict[fr.file_path])
-				
+				if fr.fid not in fids_to_replace_deprecated_entries:
+					existing_files.append(target_file_dict[fr.file_path])
 	if len(existing_files) > 0:
 		raise Exception("File(s) exist.\n" + "\n".join(existing_files))
-	print(f"Checking {len(target_files)} files")
-	print(f"There are {len(old_entries)} old entries in last export.")
+
+	# Export the files	
 	print(f"Exporting {len(target_file_dict) - 1} entries...")
-	
 	for src, dst in target_file_dict.items():
 		os.makedirs(os.path.dirname(dst), exist_ok=True)
 		shutil.copyfile(src, dst)

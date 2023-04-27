@@ -1,8 +1,4 @@
-'''
-Created on Mar 28, 2021
 
-@author: Alden
-'''
 from enum import Enum
 import multiprocessing
 import threading

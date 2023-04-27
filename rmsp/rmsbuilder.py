@@ -7,8 +7,8 @@ import threading
 from enum import Enum
 import logging
 
-from .rmscore import RMSEntryType, RMSEntry, Pipe, Task, Resource, UnrunTask, VirtualModule
-from. rmscore import RMSUpdateEvent
+from .rmscore import RMSEntryType, RMSEntry, Pipe, Task, Resource, UnrunTask, VirtualModule, FileResource, VirtualResource
+from. rmscore import RMSUpdateEvent, RMSTemplateJobStatus
 from .rmscore import _get_func_ba, _has_resource_content
 from .mphelper import ProcessWrap, ProcessWrapState
 
@@ -27,6 +27,7 @@ class RMSUnrunTasksBuilder():
 		
 		self.vfdb = {}
 		self.unruntasks = []
+		self.template_jobs = []
 		self.vm = VirtualModule()
 		
 	def onRMSUpdate(self, events):
@@ -44,6 +45,9 @@ class RMSUnrunTasksBuilder():
 					if f.file_path in self.vfdb:
 						vr = self.vfdb.pop(f.file_path)
 						self.rms.replace_virtualresource(vr, f)
+# 				for template_job in self.template_jobs:
+# 					if all(ut)
+			# Track for templatejob
 	@property
 	def sql(self):
 		return self.rms.sql
@@ -59,19 +63,19 @@ class RMSUnrunTasksBuilder():
 			if file_path in self.vfdb:
 				return self.vfdb[file_path]
 			else:
-				vr = self.rms.create_virtualresource()
+				vr = self.rms.create_virtualfileresource(file_path)
 				self.vfdb[file_path] = vr
 				return vr
 	
 	def register_pipe(self, *args, **kwargs):
 		pipe = self.rms.register_pipe(*args, **kwargs)
 		# Create an alternative pipe with self stored as rmsp 
-		pipe_rb = Pipe(pipe.pid, pipe.func, pipe.return_volatile, pipe.is_deterministic, pipe.module_name, pipe.func_name, pipe.output_func, pipe.description, pipe.tags, pipe.info, self)
+		pipe_rb = Pipe(pipe.pid, pipe._func_str, pipe.return_volatile, pipe.is_deterministic, pipe.module_name, pipe.func_name, pipe._output_func_str, pipe.description, pipe.tags, pipe.info, self)
 		return pipe_rb
 	
 	def get_pipe(self, *args, **kwargs):
 		pipe = self.rms.get_pipe(*args, **kwargs)
-		pipe_rb = Pipe(pipe.pid, pipe.func, pipe.return_volatile, pipe.is_deterministic, pipe.module_name, pipe.func_name, pipe.output_func, pipe.description, pipe.tags, pipe.info, self)
+		pipe_rb = Pipe(pipe.pid, pipe._func_str, pipe.return_volatile, pipe.is_deterministic, pipe.module_name, pipe.func_name, pipe._output_func_str, pipe.description, pipe.tags, pipe.info, self)
 		return pipe_rb
 	
 	def rmsimport(self, namespace=None, moduleobj=None, varname = None, altname=None, return_first_module=False):
@@ -234,22 +238,96 @@ class RMSUnrunTasksBuilder():
 		vr = self.rms.create_virtualresource()
 		if self.rms.scriptID is not None:
 			task_info = {"scriptid":self.rms.scriptID, **task_info}
-		
-		u = self.rms.create_unruntask(pipe.pid, args, kwargs, [vr], None,
+		if pipe.output_func is not None:
+			try:
+				def convert(arg):
+					if isinstance(arg, FileResource) or isinstance(arg, VirtualResource):
+						if arg.file_path is not None:
+							return arg.file_path
+						else:
+							return arg
+					elif isinstance(arg, Pipe):
+						return arg.func
+					else:
+						return arg
+				tmp_args = [convert(arg) for arg in args]
+				tmp_kwargs = {key:convert(arg) for key, arg in kwargs.items()}
+# 				print(tmp_args, tmp_kwargs)
+				
+				virtual_output_files = pipe.output_func(*tmp_args, **tmp_kwargs)
+				virtual_vrs = []
+				for file_path in virtual_output_files: 
+					file_path = os.path.abspath(file_path)
+					if file_path in self.vfdb:
+						tvr = self.vfdb[file_path]
+					else:
+						tvr = self.rms.create_virtualfileresource(file_path)
+						self.vfdb[file_path] = tvr
+					virtual_vrs.append(tvr)
+# 				print(virtual_output_files, virtual_vrs)				
+			except:
+				virtual_vrs = []
+		else:
+			virtual_vrs = []
+		u = self.rms.create_unruntask(pipe.pid, args, kwargs, [vr], virtual_vrs,
 									task_description, task_tags, task_info,
 									resource_description, resource_tags, resource_info,
 									fileresource_description, fileresource_tags, fileresource_info
 									)
+		
 		self.unruntasks.append(u)
 		return vr
 
-	def execute_builder(self):
-		self.rmspool.run(*self.unruntasks)
+	def run_template_job(self, template_job):
+		'''
+		This involves running multiple steps in a function
+		'''
+		vrs = []
+		rmsb_wrapper = types.SimpleNamespace()
+		rmsb_wrapper.register_file = self.register_file
+		rmsb_wrapper.file_from_path = self.file_from_path
+		rmsb_wrapper.sql = self.sql
+		def run_wrapper(*args, **kwargs):
+			vr = self.run(*args, **kwargs)
+			vrs.append(vr)
+			return vr
+		rmsb_wrapper.run = run_wrapper
+		rmsb_wrapper.get_pipe = lambda *args, **kwargs: RMSUnrunTasksBuilder.get_pipe(rmsb_wrapper, *args, **kwargs)
+		
+		def _dummy(*args, **kwargs):
+			pipe = self.register_pipe(*args, **kwargs)
+			return Pipe(pipe.pid, pipe._func_str, pipe.return_volatile, pipe.is_deterministic, pipe.module_name, pipe.func_name, pipe._output_func_str, pipe.description, pipe.tags, pipe.info, rmsb_wrapper)
+		rmsb_wrapper.register_pipe = _dummy
+		rmsb_wrapper.rmsimport = lambda *args, **kwargs: RMSUnrunTasksBuilder.rmsimport(rmsb_wrapper, *args, **kwargs) 
+		try:
+			template_job.func(rmsb_wrapper, *template_job.args, **template_job.kwargs)
+			unruntasks = [self.rms.get_unruntask(uid) for uid in set(vr.uid for vr in vrs)]
+		except:
+			import traceback
+			traceback.print_exc()
+			template_job.status = RMSTemplateJobStatus.ERROR
+			raise Exception()
+		self.template_jobs.append(template_job)
+		template_job.unruntasks.extend(unruntasks)
+		
+	def run_template(self, func, args=[], kwargs={}):
+		job = self.rms.create_template_job(func, args, kwargs)
+		self.run_template_job(job)
+		return job
+	
+	def simulate_template(self, func, args=[], kwargs={}):
+		return self.rms.simulate_template(func, args, kwargs)
+	
+	def execute_builder(self, priority=20):
+		self.rmspool.run(*self.unruntasks, priority=priority)
 		l = list(self.unruntasks)
 		self.unruntasks.clear()
+		for template_job in self.template_jobs:
+			if template_job.status == RMSTemplateJobStatus.PENDING:
+				template_job.status = RMSTemplateJobStatus.RUNNING
 		return l
 
-
+	
 class RMSPoolUpdateEvent(Enum):
 	SUBMISSION = 1
 	EXECUTION = 2
@@ -263,6 +341,8 @@ class RMSPoolUpdateEvent(Enum):
 def _dill_load(path):
 	with open(path, "rb") as fr:
 		return dill.load(fr)
+	
+	
 class RMSProcessWrapPool():
 	'''
 	Process is not recycled. Hence this is very inefficient for running many short processes. 
@@ -273,6 +353,9 @@ class RMSProcessWrapPool():
 		
 		self.nthread = nthread
 		
+# 		self.run_tasks_assistant_lock = threading.Condition() 
+# 		self.run_tasks_lock = threading.Condition()
+		 
 		self.pending_tasks_lock = threading.Condition() # A lock for accessing pending_tasks and next_pid
 		self.pending_tasks = OrderedDict()
 		self.next_pid = 0
@@ -287,6 +370,7 @@ class RMSProcessWrapPool():
 		self.resources_to_fetch = set()
 		self.fetch_resource_tasks = OrderedDict()
 		
+		# The update event lock is used related to fireUpdateEvent
 		self.update_event_lock = threading.Condition()
 		self.update_events = list()
 
@@ -296,7 +380,6 @@ class RMSProcessWrapPool():
 		# The thread run tills closing is True and no more pending tasks remain.
 		threading.Thread(target=self._run_pending_tasks).start()
 		threading.Thread(target=self._fire_update_events).start()
-		
 		
 		self.listeners = []
 		
@@ -336,7 +419,9 @@ class RMSProcessWrapPool():
 		'''
 		An unruntask is pending if it still has virtual resources not yet resolved.
 		Hence, upon any update of the virtual resource from RMS, 
-		try to notify pending_tasks_lock to check if any unruntasks can now be submitted   
+		try to notify pending_tasks_lock to check if any unruntasks can now be submitted
+		
+		(This method needs to be updated later, as multiple call to onRMSUpdate actually notify multiple times)
 		'''
 		toNotify = False
 		for event in events:
@@ -366,8 +451,8 @@ class RMSProcessWrapPool():
 		self.pending_tasks_lock.notify_all()
 		self.pending_tasks_lock.release()
 		
-		for unruntask in unruntasks:
-			self.fetch_resource_content(*unruntask.input_resources, priority=priority)
+		resources_to_fetch = [r for unruntask in unruntasks for r in unruntask.input_resources]
+		self.fetch_resource_content(*resources_to_fetch, priority=priority)
 		return registered_pids
 	
 	def fetch_resource_content(self, *resources, priority=20):
@@ -526,6 +611,12 @@ class RMSProcessWrapPool():
 								
 								executed.append(unruntask.uid)
 								func_args, func_kwargs = self.rms._ba_rms_to_func_args_kwargs(ba)
+								
+								output_files = self.rms.compute_output_files(pipe, func_args, func_kwargs)
+								if not self.rms.allow_overwrite:
+									if self.rms.exist_output_files(output_files):
+										raise Exception("Cannot overwrite files")
+								
 								pwcallback=(lambda state, raw_return_value, begin_time, end_time, pid, callback=None,unruntask=unruntask:
 																			self._completion_callback(state, raw_return_value, begin_time, end_time, pid, callback, unruntask))
 								
@@ -663,6 +754,9 @@ class RMSProcessWrapPool():
 		Add pids to finished tasks. 
 		Notify pending tasks
 		'''
+		# Precompile file md5 so that we don't block the locks for too long
+		precompiled_files_md5 = self.rms._compile_files_md5_from_pipe_ba(self.rms.get_pipe(unruntask.pid), unruntask.ba)
+		
 		self.pending_tasks_lock.acquire() # The lock is important since the callback may occassionally triggers run_pending_tasks
 		self.futures_lock.acquire() # I don't think I need this here
 		self.finished_tasks_lock.acquire()
@@ -675,7 +769,9 @@ class RMSProcessWrapPool():
 				task = self.rms.register_finished_task(raw_return_value, begin_time, end_time, unruntask.ba, pipe, 
 													unruntask.task_description, unruntask.task_tags, unruntask.task_info,
 													unruntask.resource_description, unruntask.resource_tags, unruntask.resource_info, 
-													unruntask.fileresource_description, unruntask.fileresource_tags, unruntask.fileresource_info)
+													unruntask.fileresource_description, unruntask.fileresource_tags, unruntask.fileresource_info,
+													precompiled_files_md5
+													)
 								
 				self.rms.replace_unruntask(unruntask, task)
 			elif self.futures[pid].state == ProcessWrapState.PICKLING_ERROR:
@@ -712,7 +808,7 @@ class RMSProcessWrapPool():
 	def cancel(self, pids):
 		'''
 		Attempts to cancel a task if it is still pending. 
-		If a task is being executed or completed, it will be cancelled.  
+		If a task is being executed or completed, it will not be cancelled.  
 		See also kill. 
 		'''
 		removed_from_pending_tasks = []
@@ -728,7 +824,12 @@ class RMSProcessWrapPool():
 # 		logging.info(f"Removed from pools: {join_str(removed_from_futures, ',')}")
 	def cancel_all(self):
 		'''
-		Attempts to cancel all pending tasks 
+		Attempts to cancel all pending tasks.
+		
+		If one wants to remove all pending and running tasks, use the following:
+		rmspool.cancel_all()
+		rmspool.kill_all() 
+		
 		'''
 		removed_from_pending_tasks = []
 		self.pending_tasks_lock.acquire()
@@ -740,6 +841,13 @@ class RMSProcessWrapPool():
 		
 		
 	def kill(self, pids):
+		'''
+		Attempts to kill running tasks
+		If the task is still pending, it will not be killed.
+		
+		See also cancel.  		
+		
+		'''
 		self.pending_tasks_lock.acquire()
 		self.futures_lock.acquire()
 		for pid in pids:
